@@ -2,7 +2,7 @@
 
 企业微信智能机器人 Python SDK —— 基于 WebSocket 长连接通道，提供消息收发、流式回复、模板卡片、事件回调、文件下载解密等核心能力。
 
-> 本项目为 [@wecom/aibot-node-sdk](https://github.com/anthropics/aibot-node-sdk) 的 Python 版本，API 和使用方式保持一致。
+> 本项目为 [@wecom/aibot-node-sdk](https://github.com/WecomTeam/aibot-node-sdk) 的 Python 版本，API 和使用方式保持一致。
 
 ## 特性
 
