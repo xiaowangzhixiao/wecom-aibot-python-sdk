@@ -23,8 +23,9 @@ def decrypt_file(encrypted_data: bytes, aes_key: str) -> bytes:
     if not aes_key or not isinstance(aes_key, str):
         raise ValueError("decrypt_file: aes_key must be a non-empty string")
 
-    # 将 Base64 编码的 aes_key 解码
-    key = base64.b64decode(aes_key)
+    # 将 Base64 编码的 aes_key 解码（补齐可能缺失的 padding）
+    padded = aes_key + "=" * (-len(aes_key) % 4)
+    key = base64.b64decode(padded)
 
     # IV 取 key 的前 16 字节
     iv = key[:16]
