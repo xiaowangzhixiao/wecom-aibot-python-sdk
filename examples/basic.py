@@ -48,11 +48,11 @@ async def main() -> None:
     # 监听错误事件
     ws_client.on("error", lambda error: print(f"发生错误: {error}"))
 
-    # 监听所有消息
+    # 监听所有消息（完整打印 body，方便调试引用消息等）
     def on_message(frame):
         import json
-        body_str = json.dumps(frame.get("body", {}), ensure_ascii=False)[:200]
-        print(f"收到消息: {body_str}")
+        body = frame.get("body", {})
+        print(f"收到消息: {json.dumps(body, ensure_ascii=False, indent=2)}")
 
     ws_client.on("message", on_message)
 
