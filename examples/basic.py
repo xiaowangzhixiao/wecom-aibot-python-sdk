@@ -95,7 +95,7 @@ async def main() -> None:
             filename = result.get("filename")
             print(f"图片下载成功，大小: {len(buffer)} bytes")
 
-            save_name = filename or f"image_{int(asyncio.get_event_loop().time())}.png"
+            save_name = filename or f"image_{int(asyncio.get_running_loop().time())}.png"
             save_path = Path(__file__).parent / save_name
             save_path.write_bytes(buffer)
             print(f"图片已保存到: {save_path}")
@@ -128,7 +128,7 @@ async def main() -> None:
             filename = result.get("filename")
             print(f"文件下载成功，大小: {len(buffer)} bytes")
 
-            save_name = filename or f"file_{int(asyncio.get_event_loop().time())}"
+            save_name = filename or f"file_{int(asyncio.get_running_loop().time())}"
             save_path = Path(__file__).parent / save_name
             save_path.write_bytes(buffer)
             print(f"文件已保存到: {save_path}")
@@ -186,7 +186,7 @@ async def main() -> None:
         print("\n正在停止机器人...")
         stop_event.set()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 

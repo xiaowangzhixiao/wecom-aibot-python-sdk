@@ -55,6 +55,8 @@ class WsConnectionManager:
         self._max_reply_queue_size = 100
         # 串行锁：保证同一 req_id 的回复消息串行发送
         self._queue_locks: dict[str, asyncio.Lock] = {}
+        # 追踪回复队列处理 task，防止 GC 回收
+        self._queue_tasks: set[asyncio.Task] = set()
 
         # 回调
         self.on_connected: Callable[[], Any] | None = None
@@ -305,7 +307,7 @@ class WsConnectionManager:
 
         同一个 req_id 的消息会被放入队列中串行发送。
         """
-        future: asyncio.Future[WsFrame] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[WsFrame] = asyncio.get_running_loop().create_future()
 
         frame: WsFrame = {
             "cmd": cmd,
@@ -335,7 +337,9 @@ class WsConnectionManager:
 
         # 如果队列中只有这一条，说明当前空闲，立即开始处理
         if len(queue) == 1:
-            asyncio.create_task(self._process_reply_queue(req_id))
+            task = asyncio.create_task(self._process_reply_queue(req_id))
+            self._queue_tasks.add(task)
+            task.add_done_callback(self._queue_tasks.discard)
 
         return await future
 
@@ -369,7 +373,7 @@ class WsConnectionManager:
                     continue
 
                 # 等待回执（通过 pending_acks 机制）
-                ack_future: asyncio.Future[WsFrame] = asyncio.get_event_loop().create_future()
+                ack_future: asyncio.Future[WsFrame] = asyncio.get_running_loop().create_future()
                 self._pending_acks[req_id] = {"future": ack_future}
 
                 try:
@@ -432,6 +436,18 @@ class WsConnectionManager:
         self._is_manual_close = True
         self._stop_heartbeat()
         self._clear_pending_messages("Connection manually closed")
+
+        # 等待回复队列 task 完成（最多 5 秒）
+        if self._queue_tasks:
+            self._logger.debug(
+                f"Waiting for {len(self._queue_tasks)} reply queue task(s)..."
+            )
+            _, pending = await asyncio.wait(self._queue_tasks, timeout=5.0)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._queue_tasks.clear()
 
         if self._receive_task is not None:
             self._receive_task.cancel()

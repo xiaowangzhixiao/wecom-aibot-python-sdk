@@ -64,6 +64,9 @@ class WSClient:
         # 事件监听器
         self._listeners: dict[str, list[Callable]] = {}
 
+        # 追踪所有 async handler 创建的 task，防止 GC 回收
+        self._handler_tasks: set[asyncio.Task] = set()
+
         # 绑定 WebSocket 事件
         self._setup_ws_events()
 
@@ -130,9 +133,11 @@ class WSClient:
         for handler in handlers:
             try:
                 result = handler(*args)
-                # 如果 handler 是协程函数，将其包装为 task
+                # 如果 handler 是协程函数，将其包装为 task 并保存引用
                 if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                    task = asyncio.create_task(result)
+                    self._handler_tasks.add(task)
+                    task.add_done_callback(self._handler_tasks.discard)
             except Exception as e:
                 self._logger.error(f"Error in event handler for '{event}':", str(e))
 
@@ -163,9 +168,32 @@ class WSClient:
 
         self._logger.info("Disconnecting...")
         self._started = False
+
+        # 等待运行中的 async handler 完成（最多 30 秒）
+        await self._wait_handler_tasks(timeout=30.0)
+
         await self._ws_manager.disconnect()
         await self._api_client.close()
         self._logger.info("Disconnected")
+
+    async def _wait_handler_tasks(self, timeout: float = 30.0) -> None:
+        """等待所有 async handler task 完成，超时后取消"""
+        if not self._handler_tasks:
+            return
+
+        self._logger.info(
+            f"Waiting for {len(self._handler_tasks)} handler task(s) to complete..."
+        )
+        done, pending = await asyncio.wait(
+            self._handler_tasks, timeout=timeout
+        )
+        if pending:
+            self._logger.warn(
+                f"{len(pending)} handler task(s) timed out, cancelling..."
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ========== 消息回复 ==========
 
