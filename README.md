@@ -17,6 +17,11 @@
 - **事件回调** — 支持进入会话、模板卡片按钮点击、用户反馈等事件
 - **串行回复队列** — 同一 req_id 的回复消息串行发送，自动等待回执
 - **文件下载解密** — 内置 AES-256-CBC 文件解密，每个图片/文件消息自带独立的 aeskey
+- **临时素材上传** — 通过 WebSocket 通道分片上传（init → chunk × N → finish），支持 image / file / voice / video 类型
+- **媒体消息收发** — 被动回复媒体消息（`reply_media`）和主动发送媒体消息（`send_media_message`）
+- **断开事件感知** — 自动识别 `disconnected_event`（新连接顶替旧连接），阻止无效重连
+- **连接参数扩展** — 支持 `scene`（场景标识）和 `plug_version`（插件版本号）认证参数
+- **WebSocket 选项透传** — 通过 `ws_options` 参数传递底层 `websockets.connect()` 额外配置
 - **可插拔日志** — 支持自定义 Logger，内置带时间戳的 DefaultLogger
 - **异步架构** — 基于 `asyncio` + `websockets`，性能优异
 
@@ -96,11 +101,14 @@ ws_client = WSClient(
     bot_id="your-bot-id",
     secret="your-bot-secret",
     # 以下为可选参数
+    scene=1,                     # 场景标识
+    plug_version="1.0.0",        # 插件版本号
     reconnect_interval=1000,
     max_reconnect_attempts=10,
     heartbeat_interval=30000,
     request_timeout=10000,
     ws_url="",
+    ws_options=None,             # 透传给 websockets.connect() 的额外参数
     logger=None,
 )
 ```
@@ -120,6 +128,9 @@ ws_client = WSClient(
 | `await reply_stream_with_card(frame, stream_id, content, finish?, ...)` | 流式 + 模板卡片组合回复 | `WsFrame` |
 | `await update_template_card(frame, template_card, userids?)` | 更新模板卡片（5s 内调用） | `WsFrame` |
 | `await send_message(chatid, body)` | 主动发送消息 | `WsFrame` |
+| `await upload_media(file_data, *, type, filename)` | 上传临时素材（分片上传） | `UploadMediaFinishResult` |
+| `await reply_media(frame, media_type, media_id, ...)` | 被动回复媒体消息 | `WsFrame` |
+| `await send_media_message(chatid, media_type, media_id, ...)` | 主动发送媒体消息 | `WsFrame` |
 | `await download_file(url, aes_key?)` | 下载文件并解密 | `{"buffer": bytes, "filename": str \| None}` |
 
 #### 属性
@@ -205,17 +216,59 @@ async def on_image(frame):
 ws_client.on("message.image", on_image)
 ```
 
+### `upload_media` 详细说明
+
+通过 WebSocket 通道分片上传临时素材（三步流程：init → chunk × N → finish），单个分片不超过 512KB，最多 100 个分片。
+
+```python
+# 上传图片素材
+with open("photo.png", "rb") as f:
+    file_data = f.read()
+
+result = await ws_client.upload_media(file_data, type="image", filename="photo.png")
+print(f"media_id: {result['media_id']}")
+# result: {"type": "image", "media_id": "...", "created_at": "..."}
+```
+
+支持的素材类型：`image`、`file`、`voice`、`video`。
+
+### `reply_media` / `send_media_message` 详细说明
+
+```python
+# 被动回复媒体消息（在收到消息的 handler 中使用）
+async def on_text(frame):
+    # 先上传素材
+    result = await ws_client.upload_media(image_bytes, type="image", filename="reply.png")
+    # 被动回复图片
+    await ws_client.reply_media(frame, "image", result["media_id"])
+
+ws_client.on("message.text", on_text)
+
+# 主动发送媒体消息到指定会话
+await ws_client.send_media_message("chatid", "image", media_id)
+
+# 视频类型支持额外的标题和描述
+await ws_client.send_media_message(
+    "chatid", "video", media_id,
+    video_title="演示视频",
+    video_description="这是一段测试视频",
+)
+```
+
 ## 配置选项
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `bot_id` | `str` | 是 | — | 机器人 ID（企业微信后台获取） |
 | `secret` | `str` | 是 | — | 机器人 Secret（企业微信后台获取） |
+| `scene` | `int` | — | `None` | 场景标识，认证时传递给服务端 |
+| `plug_version` | `str` | — | `None` | 插件版本号，认证时传递给服务端 |
 | `reconnect_interval` | `int` | — | `1000` | 重连基础延迟（毫秒），指数退避递增（1s → 2s → 4s → ... → 30s 上限） |
 | `max_reconnect_attempts` | `int` | — | `10` | 最大重连次数（`-1` 表示无限重连） |
 | `heartbeat_interval` | `int` | — | `30000` | 心跳间隔（毫秒） |
 | `request_timeout` | `int` | — | `10000` | HTTP 请求超时时间（毫秒） |
 | `ws_url` | `str` | — | `wss://openws.work.weixin.qq.com` | 自定义 WebSocket 连接地址 |
+| `ws_options` | `dict` | — | `None` | 透传给 `websockets.connect()` 的额外参数 |
 | `logger` | `Logger` | — | `DefaultLogger` | 自定义日志实例 |
 
 ## 事件列表
@@ -239,6 +292,7 @@ ws_client.on("message.image", on_image)
 | `event.enter_chat` | `frame: WsFrame` | 收到进入会话事件 |
 | `event.template_card_event` | `frame: WsFrame` | 收到模板卡片事件 |
 | `event.feedback_event` | `frame: WsFrame` | 收到用户反馈事件 |
+| `event.disconnected_event` | `frame: WsFrame` | 服务端因新连接建立断开当前连接（不会自动重连） |
 
 ## 消息类型
 
@@ -259,6 +313,7 @@ SDK 支持以下事件类型（`EventType` 枚举）：
 | `ENTER_CHAT` | `"enter_chat"` | 进入会话事件 |
 | `TEMPLATE_CARD_EVENT` | `"template_card_event"` | 模板卡片事件 |
 | `FEEDBACK_EVENT` | `"feedback_event"` | 用户反馈事件 |
+| `DISCONNECTED` | `"disconnected_event"` | 服务端因新连接断开当前连接 |
 
 ## 自定义日志
 
@@ -348,6 +403,9 @@ uv run --extra examples python examples/basic.py
 | `wsClient.replyStreamWithCard(...)` | `await ws_client.reply_stream_with_card(...)` | 可选参数改为 keyword-only |
 | `wsClient.updateTemplateCard(...)` | `await ws_client.update_template_card(...)` | snake_case 命名 |
 | `wsClient.sendMessage(...)` | `await ws_client.send_message(...)` | snake_case 命名 |
+| `wsClient.uploadMedia(...)` | `await ws_client.upload_media(...)` | 分片上传临时素材 |
+| `wsClient.replyMedia(...)` | `await ws_client.reply_media(...)` | 被动回复媒体消息 |
+| `wsClient.sendMediaMessage(...)` | `await ws_client.send_media_message(...)` | 主动发送媒体消息 |
 | `wsClient.downloadFile(...)` | `await ws_client.download_file(...)` | 返回 dict 而非 object |
 | `generateReqId(prefix)` | `generate_req_id(prefix)` | snake_case 命名 |
 
