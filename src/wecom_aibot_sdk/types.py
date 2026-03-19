@@ -47,6 +47,10 @@ class WsCmd:
     RESPONSE_WELCOME = "aibot_respond_welcome_msg"
     RESPONSE_UPDATE = "aibot_respond_update_msg"
     SEND_MSG = "aibot_send_msg"
+    # 上传临时素材
+    UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
+    UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
+    UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
 
     # 企业微信 → 开发者
     CALLBACK = "aibot_msg_callback"
@@ -163,7 +167,37 @@ class SendTemplateCardMsgBody(TypedDict):
     template_card: dict[str, Any]
 
 
-SendMsgBody = SendMarkdownMsgBody | SendTemplateCardMsgBody
+# ========== 媒体消息类型 (api.ts) ==========
+
+"""企业微信媒体类型"""
+WeComMediaType = Literal["file", "image", "voice", "video"]
+
+
+class SendMediaMsgBody(TypedDict, total=False):
+    """媒体消息发送体（主动发送 + 被动回复共用）"""
+    msgtype: WeComMediaType
+    file: dict[str, str]       # {"media_id": str}
+    image: dict[str, str]      # {"media_id": str}
+    voice: dict[str, str]      # {"media_id": str}
+    video: dict[str, Any]      # {"media_id": str, "title"?: str, "description"?: str}
+
+
+SendMsgBody = SendMarkdownMsgBody | SendTemplateCardMsgBody | SendMediaMsgBody
+
+
+# ========== 上传临时素材相关类型 (api.ts) ==========
+
+class UploadMediaOptions(TypedDict):
+    """uploadMedia 方法选项"""
+    type: WeComMediaType
+    filename: str
+
+
+class UploadMediaFinishResult(TypedDict):
+    """完成上传响应"""
+    type: WeComMediaType
+    media_id: str
+    created_at: str
 
 
 # ========== 消息类型 (message.ts) ==========
@@ -184,3 +218,4 @@ class EventType(str, Enum):
     ENTER_CHAT = "enter_chat"
     TEMPLATE_CARD_EVENT = "template_card_event"
     FEEDBACK_EVENT = "feedback_event"
+    DISCONNECTED = "disconnected_event"

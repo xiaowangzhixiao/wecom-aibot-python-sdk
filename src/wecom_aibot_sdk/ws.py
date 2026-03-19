@@ -28,9 +28,11 @@ class WsConnectionManager:
         reconnect_base_delay: int = 1000,
         max_reconnect_attempts: int = 10,
         ws_url: str | None = None,
+        ws_options: dict[str, Any] | None = None,
     ) -> None:
         self._logger = logger
         self._ws_url = ws_url or DEFAULT_WS_URL
+        self._ws_options = ws_options or {}
         self._heartbeat_interval = heartbeat_interval / 1000  # 转为秒
         self._reconnect_base_delay = reconnect_base_delay / 1000  # 转为秒
         self._max_reconnect_attempts = max_reconnect_attempts
@@ -39,6 +41,7 @@ class WsConnectionManager:
         self._ws: websockets.asyncio.client.ClientConnection | None = None
         self._bot_id = ""
         self._bot_secret = ""
+        self._extra_auth_params: dict[str, Any] = {}
         self._reconnect_attempts = 0
         self._is_manual_close = False
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -65,11 +68,18 @@ class WsConnectionManager:
         self.on_message: Callable[[WsFrame], Any] | None = None
         self.on_reconnecting: Callable[[int], Any] | None = None
         self.on_error: Callable[[Exception], Any] | None = None
+        self.on_server_disconnect: Callable[[str], Any] | None = None
 
-    def set_credentials(self, bot_id: str, bot_secret: str) -> None:
+    def set_credentials(
+        self,
+        bot_id: str,
+        bot_secret: str,
+        extra_auth_params: dict[str, Any] | None = None,
+    ) -> None:
         """设置认证凭证"""
         self._bot_id = bot_id
         self._bot_secret = bot_secret
+        self._extra_auth_params = extra_auth_params or {}
 
     async def connect(self) -> None:
         """建立 WebSocket 连接"""
@@ -91,6 +101,7 @@ class WsConnectionManager:
                 ping_interval=None,  # 我们自己管理心跳
                 ping_timeout=None,
                 close_timeout=5,
+                **self._ws_options,
             )
             self._logger.info("WebSocket connection established, sending auth...")
             self._reconnect_attempts = 0
@@ -148,6 +159,7 @@ class WsConnectionManager:
                 "body": {
                     "bot_id": self._bot_id,
                     "secret": self._bot_secret,
+                    **self._extra_auth_params,
                 },
             })
             self._logger.info("Auth frame sent")
@@ -157,6 +169,7 @@ class WsConnectionManager:
     async def _handle_frame(self, frame: WsFrame) -> None:
         """处理收到的帧数据"""
         cmd = frame.get("cmd", "")
+        req_id = frame.get("headers", {}).get("req_id", "")
 
         # 消息推送
         if cmd == WsCmd.CALLBACK:
@@ -168,21 +181,36 @@ class WsConnectionManager:
         # 事件推送
         if cmd == WsCmd.EVENT_CALLBACK:
             self._logger.debug("Received event callback:", json.dumps(frame.get("body", {}), ensure_ascii=False)[:200])
+
+            # 检测 disconnected_event：有新连接建立，服务端通知旧连接即将被断开
+            body = frame.get("body", {})
+            event = body.get("event", {})
+            if event.get("eventtype") == "disconnected_event":
+                self._logger.warn(
+                    "Received disconnected_event: a new connection has been established, "
+                    "this connection will be closed by server"
+                )
+                # 先分发事件给上层（让用户可以监听 event.disconnected_event）
+                if self.on_message:
+                    self.on_message(frame)
+                # 停止心跳、清理待处理消息
+                self._stop_heartbeat()
+                self._clear_pending_messages("Server disconnected due to new connection")
+                # 标记阻止自动重连（服务端正常行为，重连也会被再次断开）
+                self._is_manual_close = True
+                # 通知上层服务端主动断开
+                if self.on_server_disconnect:
+                    self.on_server_disconnect("New connection established, server disconnected this connection")
+                return
+
             if self.on_message:
                 self.on_message(frame)
             return
 
         # 无 cmd 的帧：认证响应、心跳响应或回复消息回执
-        headers = frame.get("headers", {})
-        req_id = headers.get("req_id", "")
 
-        # 回复消息的回执
-        if req_id in self._pending_acks:
-            self._handle_reply_ack(req_id, frame)
-            return
-
+        # 认证响应（优先于 pendingAcks 检查，避免误判）
         if req_id.startswith(WsCmd.SUBSCRIBE):
-            # 认证响应
             errcode = frame.get("errcode", -1)
             if errcode != 0:
                 self._logger.error(
@@ -199,8 +227,8 @@ class WsConnectionManager:
                 self.on_authenticated()
             return
 
+        # 心跳响应（优先于 pendingAcks 检查，避免误判）
         if req_id.startswith(WsCmd.HEARTBEAT):
-            # 心跳响应
             errcode = frame.get("errcode", -1)
             if errcode != 0:
                 self._logger.warn(
@@ -208,13 +236,15 @@ class WsConnectionManager:
                 )
                 return
             self._missed_pong_count = 0
-            self._logger.debug("Received heartbeat ack")
             return
 
-        # 未知帧类型
-        self._logger.warn("Received unknown frame:", json.dumps(frame, ensure_ascii=False)[:200])
-        if self.on_message:
-            self.on_message(frame)
+        # 回复消息的回执
+        if req_id in self._pending_acks:
+            self._handle_reply_ack(req_id, frame)
+            return
+
+        # 未知帧类型 — 只记录警告，不传给 onMessage（避免 body=undefined 导致下游误处理）
+        self._logger.warn("Received unknown frame (ignored):", json.dumps(frame, ensure_ascii=False)[:200])
 
     def _start_heartbeat(self) -> None:
         """启动心跳定时器"""
@@ -417,15 +447,23 @@ class WsConnectionManager:
 
     def _clear_pending_messages(self, reason: str) -> None:
         """清理所有待处理的消息和回执"""
-        for _req_id, pending in self._pending_acks.items():
+        # 收集已在 pendingAcks 中被 reject 的 future，用于后续去重
+        rejected_futures: set[int] = set()
+
+        # 先清理 pendingAcks
+        for req_id, pending in self._pending_acks.items():
             fut: asyncio.Future = pending["future"]
             if not fut.done():
-                fut.set_exception(Exception(reason))
+                fut.set_exception(Exception(f"{reason}, reply for reqId: {req_id} cancelled"))
+                rejected_futures.add(id(fut))
         self._pending_acks.clear()
 
+        # 再清理 replyQueues，跳过已在 pendingAcks 中被 reject 过的 future
         for req_id, queue in self._reply_queues.items():
             for item in queue:
                 fut = item["future"]
+                if id(fut) in rejected_futures:
+                    continue  # 已在 pendingAcks 中被 reject 过，跳过
                 if not fut.done():
                     fut.set_exception(Exception(f"{reason}, reply for reqId: {req_id} cancelled"))
         self._reply_queues.clear()

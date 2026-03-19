@@ -6,6 +6,8 @@ WSClient 核心客户端
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import math
 from typing import Any, Callable
 
 from wecom_aibot_sdk.types import (
@@ -13,6 +15,8 @@ from wecom_aibot_sdk.types import (
     WsFrame,
     ReplyMsgItem,
     ReplyFeedback,
+    WeComMediaType,
+    UploadMediaFinishResult,
 )
 from wecom_aibot_sdk.api import WeComApiClient
 from wecom_aibot_sdk.ws import WsConnectionManager
@@ -35,11 +39,14 @@ class WSClient:
         bot_id: str,
         secret: str,
         *,
+        scene: int | None = None,
+        plug_version: str | None = None,
         reconnect_interval: int = 1000,
         max_reconnect_attempts: int = 10,
         heartbeat_interval: int = 30000,
         request_timeout: int = 10000,
         ws_url: str = "",
+        ws_options: dict[str, Any] | None = None,
         logger: Any | None = None,
     ) -> None:
         self._logger = logger or DefaultLogger()
@@ -55,8 +62,16 @@ class WSClient:
             reconnect_interval,
             max_reconnect_attempts,
             ws_url or None,
+            ws_options,
         )
-        self._ws_manager.set_credentials(bot_id, secret)
+
+        # 构建额外认证参数
+        extra_auth_params: dict[str, Any] = {}
+        if scene is not None:
+            extra_auth_params["scene"] = scene
+        if plug_version is not None:
+            extra_auth_params["plug_version"] = plug_version
+        self._ws_manager.set_credentials(bot_id, secret, extra_auth_params or None)
 
         # 初始化消息处理器
         self._message_handler = MessageHandler(self._logger)
@@ -81,6 +96,14 @@ class WSClient:
         self._ws_manager.on_reconnecting = lambda attempt: self.emit("reconnecting", attempt)
         self._ws_manager.on_error = lambda error: self.emit("error", error)
         self._ws_manager.on_message = lambda frame: self._message_handler.handle_frame(frame, self)
+
+        # 服务端因新连接建立而主动断开旧连接
+        def _on_server_disconnect(reason: str) -> None:
+            self._logger.warn(f"Server disconnected this connection: {reason}")
+            self._started = False
+            self.emit("disconnected", reason)
+
+        self._ws_manager.on_server_disconnect = _on_server_disconnect
 
     # ========== 事件系统 ==========
 
@@ -108,6 +131,7 @@ class WSClient:
             - ``event.enter_chat`` — 收到进入会话事件
             - ``event.template_card_event`` — 收到模板卡片事件
             - ``event.feedback_event`` — 收到用户反馈事件
+            - ``event.disconnected_event`` — 服务端因新连接建立而主动断开当前连接
         """
         if event not in self._listeners:
             self._listeners[event] = []
@@ -371,6 +395,227 @@ class WSClient:
         req_id = generate_req_id(WsCmd.SEND_MSG)
         full_body = {"chatid": chatid, **body}
         return await self._ws_manager.send_reply(req_id, full_body, WsCmd.SEND_MSG)
+
+    # ========== 媒体素材上传与发送 ==========
+
+    async def upload_media(
+        self,
+        file_data: bytes,
+        *,
+        type: WeComMediaType,
+        filename: str,
+    ) -> UploadMediaFinishResult:
+        """
+        上传临时素材（三步分片上传）
+
+        通过 WebSocket 长连接执行分片上传：init → chunk × N → finish
+        单个分片不超过 512KB（Base64 编码前），最多 100 个分片。
+
+        :param file_data: 文件字节数据
+        :param type: 素材类型（file / image / voice / video）
+        :param filename: 文件名
+        :returns: 上传结果，包含 media_id
+        """
+        import base64
+
+        total_size = len(file_data)
+        CHUNK_SIZE = 512 * 1024  # 512KB
+        total_chunks = math.ceil(total_size / CHUNK_SIZE)
+
+        if total_chunks > 100:
+            raise ValueError(
+                f"File too large: {total_chunks} chunks exceeds maximum of 100 chunks (max ~50MB)"
+            )
+
+        # 计算文件 MD5
+        md5 = hashlib.md5(file_data).hexdigest()
+
+        self._logger.info(
+            f"Uploading media: type={type}, filename={filename}, "
+            f"size={total_size}, chunks={total_chunks}"
+        )
+
+        # Step 1: 初始化上传
+        init_req_id = generate_req_id(WsCmd.UPLOAD_MEDIA_INIT)
+        init_result = await self._ws_manager.send_reply(
+            init_req_id,
+            {
+                "type": type,
+                "filename": filename,
+                "total_size": total_size,
+                "total_chunks": total_chunks,
+                "md5": md5,
+            },
+            WsCmd.UPLOAD_MEDIA_INIT,
+        )
+
+        upload_id = (init_result.get("body") or {}).get("upload_id")
+        if not upload_id:
+            raise RuntimeError(
+                f"Upload init failed: no upload_id returned. Response: {init_result}"
+            )
+
+        self._logger.info(f"Upload init success: upload_id={upload_id}")
+
+        # Step 2: 分片上传（带重试，根据分片数动态调整并发）
+        MAX_CHUNK_RETRIES = 2
+        # 动态并发数
+        if total_chunks <= 4:
+            max_concurrency = total_chunks
+        elif total_chunks <= 10:
+            max_concurrency = 3
+        else:
+            max_concurrency = 2
+
+        async def upload_chunk(chunk_index: int) -> None:
+            start = chunk_index * CHUNK_SIZE
+            end = min(start + CHUNK_SIZE, total_size)
+            chunk = file_data[start:end]
+            base64_data = base64.b64encode(chunk).decode("ascii")
+
+            last_error: Exception | None = None
+            for attempt in range(MAX_CHUNK_RETRIES + 1):
+                try:
+                    chunk_req_id = generate_req_id(WsCmd.UPLOAD_MEDIA_CHUNK)
+                    await self._ws_manager.send_reply(
+                        chunk_req_id,
+                        {
+                            "upload_id": upload_id,
+                            "chunk_index": chunk_index,
+                            "base64_data": base64_data,
+                        },
+                        WsCmd.UPLOAD_MEDIA_CHUNK,
+                    )
+                    self._logger.debug(
+                        f"Uploaded chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} bytes)"
+                    )
+                    return
+                except Exception as err:
+                    last_error = err
+                    if attempt < MAX_CHUNK_RETRIES:
+                        delay = 0.5 * (attempt + 1)
+                        self._logger.warn(
+                            f"Chunk {chunk_index} upload failed "
+                            f"(attempt {attempt + 1}/{MAX_CHUNK_RETRIES + 1}), "
+                            f"retrying in {delay}s... error: {err}"
+                        )
+                        await asyncio.sleep(delay)
+            raise RuntimeError(
+                f"Chunk {chunk_index} upload failed after {MAX_CHUNK_RETRIES + 1} attempts: {last_error}"
+            )
+
+        self._logger.debug(
+            f"Upload concurrency: {max_concurrency} workers for {total_chunks} chunks"
+        )
+
+        if total_chunks <= 1:
+            await upload_chunk(0)
+        else:
+            # 多分片并发上传
+            semaphore = asyncio.Semaphore(max_concurrency)
+            errors: list[Exception] = []
+
+            async def worker(idx: int) -> None:
+                async with semaphore:
+                    try:
+                        await upload_chunk(idx)
+                    except Exception as err:
+                        errors.append(err)
+
+            await asyncio.gather(*(worker(i) for i in range(total_chunks)))
+            if errors:
+                raise RuntimeError(
+                    f"Upload failed: {len(errors)} chunk(s) failed. First error: {errors[0]}"
+                )
+
+        self._logger.info(f"All {total_chunks} chunks uploaded, finishing...")
+
+        # Step 3: 完成上传
+        finish_req_id = generate_req_id(WsCmd.UPLOAD_MEDIA_FINISH)
+        finish_result = await self._ws_manager.send_reply(
+            finish_req_id,
+            {"upload_id": upload_id},
+            WsCmd.UPLOAD_MEDIA_FINISH,
+        )
+
+        finish_body = finish_result.get("body") or {}
+        media_id = finish_body.get("media_id")
+        if not media_id:
+            raise RuntimeError(
+                f"Upload finish failed: no media_id returned. Response: {finish_result}"
+            )
+
+        self._logger.info(
+            f"Upload complete: media_id={media_id}, type={finish_body.get('type', type)}"
+        )
+
+        return {
+            "type": finish_body.get("type", type),
+            "media_id": media_id,
+            "created_at": finish_body.get("created_at", ""),
+        }
+
+    async def reply_media(
+        self,
+        frame: WsFrame | dict[str, Any],
+        media_type: WeComMediaType,
+        media_id: str,
+        *,
+        video_title: str | None = None,
+        video_description: str | None = None,
+    ) -> WsFrame:
+        """
+        被动回复媒体消息（便捷方法）
+
+        :param frame: 收到的原始 WebSocket 帧，透传 headers.req_id
+        :param media_type: 媒体类型（file / image / voice / video）
+        :param media_id: 临时素材 media_id
+        :param video_title: 视频消息的标题（仅 media_type='video' 时生效）
+        :param video_description: 视频消息的描述（仅 media_type='video' 时生效）
+        """
+        media_content: dict[str, Any] = {"media_id": media_id}
+        if media_type == "video":
+            if video_title:
+                media_content["title"] = video_title
+            if video_description:
+                media_content["description"] = video_description
+
+        body: dict[str, Any] = {
+            "msgtype": media_type,
+            media_type: media_content,
+        }
+        return await self.reply(frame, body)
+
+    async def send_media_message(
+        self,
+        chatid: str,
+        media_type: WeComMediaType,
+        media_id: str,
+        *,
+        video_title: str | None = None,
+        video_description: str | None = None,
+    ) -> WsFrame:
+        """
+        主动发送媒体消息（便捷方法）
+
+        :param chatid: 会话 ID
+        :param media_type: 媒体类型（file / image / voice / video）
+        :param media_id: 临时素材 media_id
+        :param video_title: 视频消息的标题（仅 media_type='video' 时生效）
+        :param video_description: 视频消息的描述（仅 media_type='video' 时生效）
+        """
+        media_content: dict[str, Any] = {"media_id": media_id}
+        if media_type == "video":
+            if video_title:
+                media_content["title"] = video_title
+            if video_description:
+                media_content["description"] = video_description
+
+        body: dict[str, Any] = {
+            "msgtype": media_type,
+            media_type: media_content,
+        }
+        return await self.send_message(chatid, body)
 
     # ========== 文件下载 ==========
 

@@ -16,6 +16,8 @@ from wecom_aibot_sdk.types import (
     EventType,
     TemplateCardType,
     WsCmd,
+    WeComMediaType,
+    UploadMediaFinishResult,
 )
 
 __all__ = [
@@ -31,4 +33,6 @@ __all__ = [
     "EventType",
     "TemplateCardType",
     "WsCmd",
+    "WeComMediaType",
+    "UploadMediaFinishResult",
 ]
