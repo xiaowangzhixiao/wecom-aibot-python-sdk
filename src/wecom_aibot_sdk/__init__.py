@@ -18,6 +18,8 @@ from wecom_aibot_sdk.types import (
     WsCmd,
     WeComMediaType,
     UploadMediaFinishResult,
+    WSAuthFailureError,
+    WSReconnectExhaustedError,
 )
 
 __all__ = [
@@ -35,4 +37,6 @@ __all__ = [
     "WsCmd",
     "WeComMediaType",
     "UploadMediaFinishResult",
+    "WSAuthFailureError",
+    "WSReconnectExhaustedError",
 ]

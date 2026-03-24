@@ -253,6 +253,33 @@ async def main() -> None:
 
     ws_client.on("message.file", on_file_message)
 
+    # ====================================================
+    # 测试: 视频下载解密
+    # ====================================================
+    async def on_video_message(frame):
+        body = frame.get("body", {})
+        video_url = body.get("video", {}).get("url", "")
+        print(f"\n[视频] 收到视频消息")
+
+        if not video_url:
+            return
+
+        try:
+            aes_key = body.get("video", {}).get("aeskey")
+            result = await ws_client.download_file(video_url, aes_key)
+            buffer = result["buffer"]
+            filename = result.get("filename")
+            print(f"[视频] 下载解密成功: {len(buffer)} bytes, filename={filename} ✓")
+
+            save_name = filename or f"video_{int(asyncio.get_running_loop().time())}.mp4"
+            save_path = Path(__file__).parent / save_name
+            save_path.write_bytes(buffer)
+            print(f"[视频] 已保存到: {save_path}")
+        except Exception as e:
+            print(f"[视频] 下载失败: {e}")
+
+    ws_client.on("message.video", on_video_message)
+
     # ---------- 其他事件 ----------
 
     ws_client.on("message.voice", lambda frame: print(

@@ -12,7 +12,7 @@ from typing import Any, Callable, Awaitable
 import websockets
 import websockets.asyncio.client
 
-from wecom_aibot_sdk.types import WsCmd, WsFrame
+from wecom_aibot_sdk.types import WsCmd, WsFrame, WSAuthFailureError, WSReconnectExhaustedError
 from wecom_aibot_sdk.utils import generate_req_id
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
@@ -29,6 +29,8 @@ class WsConnectionManager:
         max_reconnect_attempts: int = 10,
         ws_url: str | None = None,
         ws_options: dict[str, Any] | None = None,
+        max_reply_queue_size: int = 500,
+        max_auth_failure_attempts: int = 5,
     ) -> None:
         self._logger = logger
         self._ws_url = ws_url or DEFAULT_WS_URL
@@ -37,15 +39,19 @@ class WsConnectionManager:
         self._reconnect_base_delay = reconnect_base_delay / 1000  # 转为秒
         self._max_reconnect_attempts = max_reconnect_attempts
         self._reconnect_max_delay = 30.0  # 30 秒上限
+        self._max_auth_failure_attempts = max_auth_failure_attempts
 
         self._ws: websockets.asyncio.client.ClientConnection | None = None
         self._bot_id = ""
         self._bot_secret = ""
         self._extra_auth_params: dict[str, Any] = {}
         self._reconnect_attempts = 0
+        self._auth_failure_attempts = 0
+        self._last_close_was_auth_failure = False
         self._is_manual_close = False
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._receive_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
 
         # 心跳相关
         self._missed_pong_count = 0
@@ -55,7 +61,7 @@ class WsConnectionManager:
         self._reply_queues: dict[str, list[dict[str, Any]]] = {}
         self._pending_acks: dict[str, dict[str, Any]] = {}
         self._reply_ack_timeout = 5.0  # 5 秒
-        self._max_reply_queue_size = 100
+        self._max_reply_queue_size = max_reply_queue_size
         # 串行锁：保证同一 req_id 的回复消息串行发送
         self._queue_locks: dict[str, asyncio.Lock] = {}
         # 追踪回复队列处理 task，防止 GC 回收
@@ -85,6 +91,11 @@ class WsConnectionManager:
         """建立 WebSocket 连接"""
         self._is_manual_close = False
 
+        # 取消挂起的重连 task（防止竞态）
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
         # 清理可能未完全关闭的旧连接
         if self._ws is not None:
             try:
@@ -104,7 +115,6 @@ class WsConnectionManager:
                 **self._ws_options,
             )
             self._logger.info("WebSocket connection established, sending auth...")
-            self._reconnect_attempts = 0
             self._missed_pong_count = 0
 
             # 连接建立后立即发送认证帧
@@ -133,6 +143,7 @@ class WsConnectionManager:
         except websockets.exceptions.ConnectionClosed as e:
             reason_str = str(e) or "unknown"
             self._logger.warn(f"WebSocket connection closed: {reason_str}")
+            self._ws = None
             self._stop_heartbeat()
             self._clear_pending_messages(f"WebSocket connection closed ({reason_str})")
             if self.on_disconnected:
@@ -144,6 +155,7 @@ class WsConnectionManager:
             if self.on_error:
                 self.on_error(e)
             if not self._is_manual_close:
+                self._ws = None
                 self._stop_heartbeat()
                 self._clear_pending_messages(f"WebSocket error ({e})")
                 if self.on_disconnected:
@@ -198,6 +210,10 @@ class WsConnectionManager:
                 self._clear_pending_messages("Server disconnected due to new connection")
                 # 标记阻止自动重连（服务端正常行为，重连也会被再次断开）
                 self._is_manual_close = True
+                # 释放 ws 连接
+                if self._ws:
+                    await self._ws.close()
+                    self._ws = None
                 # 通知上层服务端主动断开
                 if self.on_server_disconnect:
                     self.on_server_disconnect("New connection established, server disconnected this connection")
@@ -220,8 +236,15 @@ class WsConnectionManager:
                     self.on_error(
                         Exception(f"Authentication failed: {frame.get('errmsg', '')} (code: {errcode})")
                     )
+                # 标记认证失败，主动关闭 ws 触发重连
+                self._last_close_was_auth_failure = True
+                if self._ws:
+                    await self._ws.close()
                 return
             self._logger.info("Authentication successful")
+            # 认证成功：重置两个计数器
+            self._reconnect_attempts = 0
+            self._auth_failure_attempts = 0
             self._start_heartbeat()
             if self.on_authenticated:
                 self.on_authenticated()
@@ -293,31 +316,74 @@ class WsConnectionManager:
 
     async def _schedule_reconnect(self) -> None:
         """安排重连"""
-        if (
-            self._max_reconnect_attempts != -1
-            and self._reconnect_attempts >= self._max_reconnect_attempts
-        ):
-            self._logger.error(
-                f"Max reconnect attempts reached ({self._max_reconnect_attempts}), giving up"
+        if self._last_close_was_auth_failure:
+            # 认证失败分支
+            self._last_close_was_auth_failure = False
+            self._auth_failure_attempts += 1
+
+            if (
+                self._max_auth_failure_attempts != -1
+                and self._auth_failure_attempts >= self._max_auth_failure_attempts
+            ):
+                self._logger.error(
+                    f"Max auth failure attempts reached ({self._max_auth_failure_attempts}), giving up"
+                )
+                error = WSAuthFailureError(self._max_auth_failure_attempts)
+                if self.on_error:
+                    self.on_error(error)
+                return
+
+            delay = min(
+                self._reconnect_base_delay * (2 ** (self._auth_failure_attempts - 1)),
+                self._reconnect_max_delay,
             )
-            if self.on_error:
-                self.on_error(Exception("Max reconnect attempts exceeded"))
-            return
 
-        self._reconnect_attempts += 1
-        delay = min(
-            self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1)),
-            self._reconnect_max_delay,
-        )
+            self._logger.info(
+                f"Auth failure, reconnecting in {delay}s "
+                f"(auth attempt {self._auth_failure_attempts}/{self._max_auth_failure_attempts})..."
+            )
+            if self.on_reconnecting:
+                self.on_reconnecting(self._auth_failure_attempts)
 
-        self._logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_attempts})...")
-        if self.on_reconnecting:
-            self.on_reconnecting(self._reconnect_attempts)
+            async def _do_reconnect() -> None:
+                await asyncio.sleep(delay)
+                if self._is_manual_close:
+                    return
+                await self.connect()
 
-        await asyncio.sleep(delay)
-        if self._is_manual_close:
-            return
-        await self.connect()
+            self._reconnect_task = asyncio.create_task(_do_reconnect())
+        else:
+            # 连接断开分支
+            self._reconnect_attempts += 1
+
+            if (
+                self._max_reconnect_attempts != -1
+                and self._reconnect_attempts >= self._max_reconnect_attempts
+            ):
+                self._logger.error(
+                    f"Max reconnect attempts reached ({self._max_reconnect_attempts}), giving up"
+                )
+                error = WSReconnectExhaustedError(self._max_reconnect_attempts)
+                if self.on_error:
+                    self.on_error(error)
+                return
+
+            delay = min(
+                self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1)),
+                self._reconnect_max_delay,
+            )
+
+            self._logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_attempts})...")
+            if self.on_reconnecting:
+                self.on_reconnecting(self._reconnect_attempts)
+
+            async def _do_reconnect() -> None:
+                await asyncio.sleep(delay)
+                if self._is_manual_close:
+                    return
+                await self.connect()
+
+            self._reconnect_task = asyncio.create_task(_do_reconnect())
 
     async def send(self, frame: WsFrame) -> None:
         """发送数据帧"""
@@ -474,6 +540,11 @@ class WsConnectionManager:
         self._is_manual_close = True
         self._stop_heartbeat()
         self._clear_pending_messages("Connection manually closed")
+
+        # 取消挂起的重连 task
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
 
         # 等待回复队列 task 完成（最多 5 秒）
         if self._queue_tasks:

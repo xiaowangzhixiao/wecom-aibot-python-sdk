@@ -43,6 +43,8 @@ class WSClient:
         plug_version: str | None = None,
         reconnect_interval: int = 1000,
         max_reconnect_attempts: int = 10,
+        max_auth_failure_attempts: int = 5,
+        max_reply_queue_size: int = 500,
         heartbeat_interval: int = 30000,
         request_timeout: int = 10000,
         ws_url: str = "",
@@ -63,6 +65,8 @@ class WSClient:
             max_reconnect_attempts,
             ws_url or None,
             ws_options,
+            max_reply_queue_size=max_reply_queue_size,
+            max_auth_failure_attempts=max_auth_failure_attempts,
         )
 
         # 构建额外认证参数
@@ -127,6 +131,7 @@ class WSClient:
             - ``message.mixed`` — 收到图文混排消息
             - ``message.voice`` — 收到语音消息
             - ``message.file`` — 收到文件消息
+            - ``message.video`` — 收到视频消息
             - ``event`` — 收到事件回调（所有事件类型）
             - ``event.enter_chat`` — 收到进入会话事件
             - ``event.template_card_event`` — 收到模板卡片事件

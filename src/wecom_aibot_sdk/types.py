@@ -209,6 +209,7 @@ class MessageType(str, Enum):
     MIXED = "mixed"
     VOICE = "voice"
     FILE = "file"
+    VIDEO = "video"
 
 
 # ========== 事件类型 (event.ts) ==========
@@ -219,3 +220,21 @@ class EventType(str, Enum):
     TEMPLATE_CARD_EVENT = "template_card_event"
     FEEDBACK_EVENT = "feedback_event"
     DISCONNECTED = "disconnected_event"
+
+
+# ========== 自定义错误类型 (common.ts) ==========
+
+class WSAuthFailureError(Exception):
+    """认证失败重试次数用尽"""
+    code = "WS_AUTH_FAILURE_EXHAUSTED"
+
+    def __init__(self, max_attempts: int):
+        super().__init__(f"Max auth failure attempts exceeded ({max_attempts})")
+
+
+class WSReconnectExhaustedError(Exception):
+    """连接断开重连次数用尽"""
+    code = "WS_RECONNECT_EXHAUSTED"
+
+    def __init__(self, max_attempts: int):
+        super().__init__(f"Max reconnect attempts exceeded ({max_attempts})")

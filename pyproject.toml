@@ -1,6 +1,6 @@
 [project]
 name = "wecom-aibot-sdk"
-version = "1.0.4"
+version = "1.0.5"
 description = "企业微信智能机器人 Python SDK —— 基于 WebSocket 长连接通道"
 readme = "README.md"
 license = "MIT"
@@ -32,6 +32,10 @@ dependencies = [
 examples = [
     "python-dotenv>=1.0.0",
 ]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/xiaowangzhixiao/wecom-aibot-python-sdk"
@@ -44,3 +48,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wecom_aibot_sdk"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
