@@ -166,9 +166,20 @@ class WSClient:
                 if asyncio.iscoroutine(result):
                     task = asyncio.create_task(result)
                     self._handler_tasks.add(task)
-                    task.add_done_callback(self._handler_tasks.discard)
+                    task.add_done_callback(
+                        lambda t, ev=event: self._on_handler_task_done(t, ev)
+                    )
             except Exception as e:
                 self._logger.error(f"Error in event handler for '{event}':", str(e))
+
+    def _on_handler_task_done(self, task: asyncio.Task, event: str) -> None:
+        """async handler task 完成回调：清理引用并记录未捕获异常"""
+        self._handler_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._logger.error(f"Error in async event handler for '{event}':", str(exc))
 
     # ========== 连接管理 ==========
 
