@@ -513,23 +513,18 @@ class WsConnectionManager:
 
     def _clear_pending_messages(self, reason: str) -> None:
         """清理所有待处理的消息和回执"""
-        # 收集已在 pendingAcks 中被 reject 的 future，用于后续去重
-        rejected_futures: set[int] = set()
-
-        # 先清理 pendingAcks
+        # 清理 pendingAcks（正在等待服务端回执的 ack_future）
         for req_id, pending in self._pending_acks.items():
             fut: asyncio.Future = pending["future"]
             if not fut.done():
                 fut.set_exception(Exception(f"{reason}, reply for reqId: {req_id} cancelled"))
-                rejected_futures.add(id(fut))
         self._pending_acks.clear()
 
-        # 再清理 replyQueues，跳过已在 pendingAcks 中被 reject 过的 future
+        # 清理 replyQueues（调用方持有的 caller_future）
+        # 注：caller_future 和 ack_future 是不同对象，fut.done() 检查足以防止重复设置
         for req_id, queue in self._reply_queues.items():
             for item in queue:
                 fut = item["future"]
-                if id(fut) in rejected_futures:
-                    continue  # 已在 pendingAcks 中被 reject 过，跳过
                 if not fut.done():
                     fut.set_exception(Exception(f"{reason}, reply for reqId: {req_id} cancelled"))
         self._reply_queues.clear()
