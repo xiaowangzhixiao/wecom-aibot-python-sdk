@@ -313,6 +313,26 @@ class TestConnectCancelsReconnect:
 
         mock_task.cancel.assert_not_called()
 
+    async def test_connect_keeps_current_reconnect_task_registered_until_return(self):
+        mgr = _make_manager()
+        mgr.set_credentials("bot1", "secret1")
+
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        mgr._reconnect_task = current_task
+
+        async def _failing_connect(*args, **kwargs):
+            assert mgr._reconnect_task is current_task
+            raise ConnectionError("test")
+
+        with patch("websockets.asyncio.client.connect", new_callable=AsyncMock) as mock_connect:
+            mock_connect.side_effect = _failing_connect
+            with patch.object(mgr, "_schedule_reconnect", new_callable=AsyncMock):
+                await mgr.connect()
+
+        assert mgr._reconnect_task is None
+        mock_connect.assert_awaited_once()
+
 
 # ========== disconnect() 取消挂起重连 task 测试 ==========
 
@@ -341,6 +361,32 @@ class TestDisconnectCancelsReconnect:
         await mgr.disconnect()
 
         mock_task.cancel.assert_not_called()
+
+    async def test_disconnect_cancels_inflight_reconnect_connect(self):
+        mgr = _make_manager()
+        mgr.set_credentials("bot1", "secret1")
+
+        connect_started = asyncio.Event()
+
+        async def _blocked_connect(*args, **kwargs):
+            connect_started.set()
+            await asyncio.Future()
+
+        with patch("websockets.asyncio.client.connect", new_callable=AsyncMock) as mock_connect:
+            mock_connect.side_effect = _blocked_connect
+
+            reconnect_task = asyncio.create_task(mgr.connect())
+            mgr._reconnect_task = reconnect_task
+
+            await connect_started.wait()
+            assert mgr._reconnect_task is reconnect_task
+
+            await mgr.disconnect()
+
+            with pytest.raises(asyncio.CancelledError):
+                await reconnect_task
+
+        assert mgr._reconnect_task is None
 
     async def test_disconnect_sets_manual_close(self):
         mgr = _make_manager()
