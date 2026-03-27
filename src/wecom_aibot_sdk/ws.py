@@ -92,9 +92,14 @@ class WsConnectionManager:
         self._is_manual_close = False
 
         # 取消挂起的重连 task（防止竞态）
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+        current_task = asyncio.current_task()
+        called_from_reconnect_task = self._reconnect_task is current_task
+        if self._reconnect_task is not None:
+            if not called_from_reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
+                self._reconnect_task = None
+            elif not called_from_reconnect_task:
+                self._reconnect_task = None
 
         # 清理可能未完全关闭的旧连接
         if self._ws is not None:
@@ -130,6 +135,11 @@ class WsConnectionManager:
             if self.on_error:
                 self.on_error(e)
             await self._schedule_reconnect()
+        finally:
+            # 如果 connect() 是由当前重连 task 自己执行的，
+            # 则在整个连接流程结束后再清理追踪引用，避免中途失去取消句柄。
+            if called_from_reconnect_task and self._reconnect_task is current_task:
+                self._reconnect_task = None
 
     async def _receive_loop(self) -> None:
         """接收消息循环"""
