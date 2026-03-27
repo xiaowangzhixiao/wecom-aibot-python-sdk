@@ -390,6 +390,60 @@ uv sync --extra examples
 uv run --extra examples python examples/basic.py
 ```
 
+## 发布到 PyPI
+
+仓库已提供 GitHub Actions 发布流程，工作流文件为 [`.github/workflows/release.yml`](/Users/wangzhi/code/wecom-aibot-python-sdk/.github/workflows/release.yml)。
+
+推荐流程：
+
+1. 在 `main` 分支完成代码合并，并把 [`pyproject.toml`](/Users/wangzhi/code/wecom-aibot-python-sdk/pyproject.toml) 里的版本号更新到要发布的版本。
+2. 推送 `main` 后，在对应提交上创建并推送版本标签，例如 `v1.0.6`。
+3. GitHub Actions 会在 tag push 后执行测试、构建 `sdist` / `wheel`，然后通过 PyPI Trusted Publisher 自动发布。
+
+注意：
+
+- 推送的 tag 必须和 [`pyproject.toml`](/Users/wangzhi/code/wecom-aibot-python-sdk/pyproject.toml) 中的版本一致，例如版本是 `1.0.6` 时，tag 必须是 `v1.0.6`
+- workflow 已内置这个校验，不一致会直接失败，避免错误版本被发布到 PyPI
+
+示例命令：
+
+```bash
+git switch main
+git pull
+git tag v1.0.6
+git push origin v1.0.6
+```
+
+为什么使用 tag 触发，而不是“`main` 分支版本号一变就自动发布”：
+
+- tag 发布更明确，避免普通版本改动或预备提交误触发正式发布。
+- 可以配合 GitHub 的 protected tags 和 environment 审批，安全性更高。
+- 这也是 PyPI Trusted Publishing 官方文档中更常见、风险更低的模式。
+
+### PyPI Trusted Publisher 配置
+
+在 PyPI 项目页面进入 `Manage` -> `Publishing` -> `Add a new publisher`，选择 `GitHub Actions`，填写：
+
+- `Owner`: `xiaowangzhixiao`
+- `Repository name`: `wecom-aibot-python-sdk`
+- `Workflow name`: `release.yml`
+- `Environment name`: `pypi`
+
+其中 `Environment name` 不是强制项，但官方强烈建议配置。建议同时在 GitHub 仓库里创建 `pypi` environment，并开启以下保护：
+
+- 只允许 `main` 分支和 `v*` 标签使用这个 environment
+- 为 environment 配置 required reviewers
+- 为 `v*` 配置 protected tags
+
+### 工作流结构
+
+当前发布 workflow 分成两个 job：
+
+- `build`: 安装依赖、运行测试、构建 `dist/` 产物，并上传为 artifact
+- `publish`: 下载 `dist/` 产物，用 `pypa/gh-action-pypi-publish` 通过 OIDC 发布到 PyPI
+
+这样可以把 `id-token: write` 权限只留给真正执行发布的 job，符合 PyPI 和 PyPA 的最佳实践。
+
 ## 与 Node.js SDK 的对应关系
 
 | Node.js | Python | 说明 |
