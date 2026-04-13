@@ -152,3 +152,35 @@ class TestEventCallback:
         }
         self.handler.handle_frame(frame, self.emitter)
         self.emitter.emit.assert_not_called()
+
+    def test_event_body_is_none(self):
+        """body 为 None 时不崩溃"""
+        frame = {
+            "cmd": WsCmd.EVENT_CALLBACK,
+            "headers": {"req_id": "x"},
+            "body": None,
+        }
+        self.handler.handle_frame(frame, self.emitter)
+        self.emitter.emit.assert_not_called()
+
+    def test_event_event_field_is_none(self):
+        """body.event 为 None 时不崩溃，仍触发通用 event 事件"""
+        frame = {
+            "cmd": WsCmd.EVENT_CALLBACK,
+            "headers": {"req_id": "x"},
+            "body": {"msgtype": "event", "event": None},
+        }
+        self.handler.handle_frame(frame, self.emitter)
+        self.emitter.emit.assert_any_call("event", frame)
+        # 没有 eventtype，不触发特定事件
+        assert self.emitter.emit.call_count == 1
+
+    def test_message_body_is_none(self):
+        """消息帧 body 为 None 时不崩溃"""
+        frame = {
+            "cmd": WsCmd.CALLBACK,
+            "headers": {"req_id": "x"},
+            "body": None,
+        }
+        self.handler.handle_frame(frame, self.emitter)
+        self.emitter.emit.assert_not_called()

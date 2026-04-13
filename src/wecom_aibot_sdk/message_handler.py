@@ -45,7 +45,7 @@ class MessageHandler:
 
     def _handle_message_callback(self, frame: WsFrame, emitter: WSClient) -> None:
         """处理消息推送回调 (aibot_msg_callback)"""
-        body = frame.get("body", {})
+        body = frame.get("body") or {}
 
         # 触发通用消息事件
         emitter.emit("message", frame)
@@ -69,13 +69,13 @@ class MessageHandler:
 
     def _handle_event_callback(self, frame: WsFrame, emitter: WSClient) -> None:
         """处理事件推送回调 (aibot_event_callback)"""
-        body = frame.get("body", {})
+        body = frame.get("body") or {}
 
         # 触发通用事件
         emitter.emit("event", frame)
 
         # 根据事件类型触发特定事件
-        event = body.get("event", {})
+        event = body.get("event") or {}
         event_type = event.get("eventtype", "")
         if event_type:
             emitter.emit(f"event.{event_type}", frame)
