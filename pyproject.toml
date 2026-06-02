@@ -1,6 +1,6 @@
 [project]
 name = "wecom-aibot-sdk"
-version = "1.0.7"
+version = "1.0.8"
 description = "企业微信智能机器人 Python SDK —— 基于 WebSocket 长连接通道"
 readme = "README.md"
 license = "MIT"
