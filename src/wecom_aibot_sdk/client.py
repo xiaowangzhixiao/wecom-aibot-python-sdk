@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from wecom_aibot_sdk.types import (
     WsCmd,
@@ -289,6 +289,48 @@ class WSClient:
             "msgtype": "stream",
             "stream": stream,
         })
+
+    def has_pending_reply_ack(self, frame: WsFrame | dict[str, Any]) -> bool:
+        """
+        检查指定帧的 req_id 是否仍有待回执
+
+        :param frame: 收到的原始 WebSocket 帧，从 headers.req_id 中读取
+        :returns: 若该 req_id 仍有未完成的回执则返回 ``True``，否则返回 ``False``
+        """
+        headers = frame.get("headers", {}) if frame else {}
+        req_id = headers.get("req_id", "") if headers else ""
+        if not req_id:
+            return False
+        return self._ws_manager.has_pending_ack(req_id)
+
+    async def reply_stream_non_blocking(
+        self,
+        frame: WsFrame | dict[str, Any],
+        stream_id: str,
+        content: str,
+        finish: bool = False,
+        msg_item: list[ReplyMsgItem] | None = None,
+        feedback: ReplyFeedback | None = None,
+    ) -> WsFrame | Literal["skipped"]:
+        """
+        发送流式文本回复（非阻塞版本）
+
+        若上一条流式回复仍在等待回执，则直接跳过本次发送，避免阻塞流式输出；
+        当 ``finish=True`` 时强制发送，确保结束帧不会丢失。
+
+        :param frame: 收到的原始 WebSocket 帧，透传 headers.req_id
+        :param stream_id: 流式消息 ID
+        :param content: 回复内容（支持 Markdown）
+        :param finish: 是否结束流式消息，默认 False
+        :param msg_item: 图文混排项（仅在 finish=True 时有效）
+        :param feedback: 反馈信息（仅在首次回复时设置）
+        :returns: 正常发送返回 ``WsFrame``；被跳过时返回 ``"skipped"``
+        """
+        if not finish and self.has_pending_reply_ack(frame):
+            return "skipped"
+        return await self.reply_stream(
+            frame, stream_id, content, finish, msg_item=msg_item, feedback=feedback
+        )
 
     async def reply_welcome(
         self,

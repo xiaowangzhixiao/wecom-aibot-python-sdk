@@ -576,6 +576,10 @@ class WsConnectionManager:
 
         self._logger.info("WebSocket connection manually closed")
 
+    def has_pending_ack(self, req_id: str) -> bool:
+        """检查指定 req_id 是否有待回执（用于流式场景中的非阻塞回复判断）"""
+        return req_id in self._pending_acks
+
     @property
     def is_connected(self) -> bool:
         """获取当前连接状态"""
